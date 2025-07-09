@@ -41,7 +41,9 @@ NS_PUT_IN_TCM alignas(16) static uint8_t tcm_model_array[TCM_MODEL_SIZE];
 AM_SHARED_RW alignas(16) static uint8_t sram_model_array[SRAM_MODEL_SIZE];
 
 typedef enum { MODEL_LOC_TCM = 0, MODEL_LOC_SRAM = 1 } model_location_t;
+typedef enum { ARENA_LOC_TCM = 0, ARENA_LOC_SRAM = 1 } arena_location_t;
 static model_location_t selected_model_location = MODEL_LOC_TCM;
+static arena_location_t selected_arena_location = ARENA_LOC_TCM;
 
 // Model upload state
 typedef struct {
@@ -107,11 +109,20 @@ void sendAck(uint32_t chunk_id) {
     webusb_send_data(ack, 5);
 }
 
-// Handle configuration message to set model location
+// Handle configuration message to set model location and arena location
 void handle_model_config(const uint8_t* data, uint32_t length) {
     if (length < 1) return;
     selected_model_location = (data[0] == 1) ? MODEL_LOC_SRAM : MODEL_LOC_TCM;
     ns_lp_printf("Model location set to: %s\n", selected_model_location == MODEL_LOC_SRAM ? "SRAM" : "TCM");
+    
+    if (length >= 2) {
+        selected_arena_location = (data[1] == 1) ? ARENA_LOC_SRAM : ARENA_LOC_TCM;
+        ns_lp_printf("Arena location set to: %s\n", selected_arena_location == ARENA_LOC_SRAM ? "SRAM" : "TCM");
+    } else {
+        // Default arena location to match model location for backward compatibility
+        selected_arena_location = (selected_model_location == MODEL_LOC_SRAM) ? ARENA_LOC_SRAM : ARENA_LOC_TCM;
+        ns_lp_printf("Arena location defaulted to: %s\n", selected_arena_location == ARENA_LOC_SRAM ? "SRAM" : "TCM");
+    }
 }
 
 void handle_model_chunk(const uint8_t* data, uint32_t length) {
@@ -189,7 +200,7 @@ void run_model_and_send_stats() {
     // Select model buffer and arena
     uint8_t* model_data = (selected_model_location == MODEL_LOC_SRAM) ? sram_model_array : tcm_model_array;
     size_t model_len = model_state.model_size;
-    uint8_t* arena = (selected_model_location == MODEL_LOC_SRAM) ? sram_arena : tcm_arena;
+    uint8_t* arena = (selected_arena_location == ARENA_LOC_SRAM) ? sram_arena : tcm_arena;
     
     ns_lp_printf("Using model location: %s\n", selected_model_location == MODEL_LOC_SRAM ? "SRAM" : "TCM");
     ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_len);
