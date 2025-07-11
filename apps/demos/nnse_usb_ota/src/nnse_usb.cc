@@ -18,6 +18,19 @@
 #include "ns_malloc.h"
 #include "ns_model.h"
 
+// Add profiling includes
+#include "ns_energy_monitor.h"
+#include "ns_pmu_utils.h"
+#include "ns_pmu_map.h"
+#include "ns_power_profile.h"
+
+#ifdef NS_MLPROFILE
+#ifdef AM_PART_APOLLO5B
+extern ns_pmu_config_t ns_microProfilerPMU;
+extern ns_profiler_sidecar_t ns_microProfilerSidecar;
+#endif
+#endif
+
 // Message header structure (13 bytes)
 typedef struct {
     uint32_t crc32;
@@ -33,7 +46,7 @@ typedef struct {
 #define CHUNK_CMD_RUN_STATS  0x04
 
 // Maximum model sizes for TCM and SRAM
-#define TCM_MODEL_SIZE  (256 * 1024) // 256KB
+#define TCM_MODEL_SIZE  (200 * 1024) // 256KB
 #define SRAM_MODEL_SIZE (512 * 1024) // 512KB
 
 // Statically allocated model arrays
@@ -44,6 +57,11 @@ typedef enum { MODEL_LOC_TCM = 0, MODEL_LOC_SRAM = 1 } model_location_t;
 typedef enum { ARENA_LOC_TCM = 0, ARENA_LOC_SRAM = 1 } arena_location_t;
 static model_location_t selected_model_location = MODEL_LOC_TCM;
 static arena_location_t selected_arena_location = ARENA_LOC_TCM;
+
+#define ARENA_SIZE (128 * 1024) // Increased from 16KB to 64KB for model tensor allocation
+NS_PUT_IN_TCM alignas(16) static uint8_t tcm_arena[ARENA_SIZE];
+AM_SHARED_RW alignas(16) static uint8_t sram_arena[ARENA_SIZE];
+static ns_model_state_t model_state_struct;
 
 // Model upload state
 typedef struct {
@@ -95,6 +113,69 @@ const ns_power_config_t ns_power_usb = {
     .bEnableTempCo = false,
     .bNeedITM = true,
     .bNeedXtal = true};
+
+// Profiling function based on tflm_profiling.cc approach
+typedef struct {
+    uint32_t num_layers;
+    TfLiteStatus invoke_status;
+} profiling_result_t;
+
+profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
+    profiling_result_t result = {0, kTfLiteOk};
+    
+    ns_lp_printf("Starting TFLM profiling...\n");
+    
+    // Initialize power monitoring
+    ns_init_power_monitor_state();
+    ns_set_power_monitor_state(NS_IDLE);
+    
+    // Dump power-related registers (optional)
+    ns_lp_printf("Current power and performance register settings:\n");
+    #ifdef AM_PART_APOLLO5B
+    capture_snapshot(0);
+    print_snapshot(0, false);
+    #else
+    ns_pp_ap5_snapshot(false, 0, false);
+    ns_pp_ap5_snapshot(false, 0, true);
+    #endif
+    
+    ns_set_power_monitor_state(3); // GPIO to signal profiling phase
+    
+    ns_lp_printf("First Run: basic capture\n");
+    ns_set_power_monitor_state(0); // GPIO 00 indicates inference is under way
+    
+    #ifndef AM_PART_APOLLO5B
+        ns_reset_perf_counters(); // Reset performance counters
+        ns_start_perf_profiler(); // Start the profiler
+    #endif
+    
+    // Run inference with TFLM profiling
+    result.invoke_status = model_state->interpreter->Invoke();
+    
+    #ifndef AM_PART_APOLLO5B
+        ns_stop_perf_profiler(); // Stop the profiler
+    #endif
+    
+    // Log profiling data if available
+    if (model_state->profiler != nullptr) {
+        model_state->profiler->LogCsv(); // prints and captures events in buffer
+        
+        // Get number of layers from profiler sidecar
+        #ifdef AM_PART_APOLLO5B
+        result.num_layers = ns_microProfilerSidecar.captured_event_num;
+        #endif
+        
+        ns_lp_printf("Number of layers: %d\n", result.num_layers);
+    }
+    
+    ns_set_power_monitor_state(2); // GPIO 02 indicates profiling complete
+    
+    return result;
+}
+
+// profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
+//     return result;
+// }
 
 // Model upload functions
 void sendAck(uint32_t chunk_id) {
@@ -179,11 +260,6 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
     }
 }
 
-#define ARENA_SIZE (128 * 1024) // Adjust as needed
-alignas(16) static uint8_t tcm_arena[ARENA_SIZE];
-AM_SHARED_RW alignas(16) static uint8_t sram_arena[ARENA_SIZE];
-static ns_model_state_t model_state_struct;
-
 void run_model_and_send_stats() {
     ns_lp_printf("=== run_model_and_send_stats called ===\n");
     
@@ -211,8 +287,18 @@ void run_model_and_send_stats() {
     model_state_struct.arena = arena;
     model_state_struct.arena_size = ARENA_SIZE;
     
+    // Provide timer for profiling if NS_MLPROFILE is defined
+    #ifdef NS_MLPROFILE
+    static ns_timer_config_t tickTimer = {
+        .api = &ns_timer_V1_0_0,
+        .timer = NS_TIMER_COUNTER,
+        .enableInterrupt = false,
+    };
+    model_state_struct.tickTimer = &tickTimer;
+    #endif
+    
     ns_lp_printf("Initializing model...\n");
-    int status = ns_model_init(&model_state_struct);
+    int status = ns_model_minimal_init(&model_state_struct);
     if (status != 0) {
         ns_lp_printf("Model init failed with status: %d\n", status);
         // Send error response
@@ -224,32 +310,115 @@ void run_model_and_send_stats() {
     ns_lp_printf("Model init successful\n");
     ns_lp_printf("Number of input tensors: %d\n", model_state_struct.numInputTensors);
     
-    // Optionally fill input tensor with zeros
+    // Enhanced input tensor handling
     for (uint32_t i = 0; i < model_state_struct.numInputTensors; i++) {
-        memset(model_state_struct.model_input[i]->data.int8, 0, model_state_struct.model_input[i]->bytes);
-        ns_lp_printf("Input tensor %d: %d bytes\n", i, model_state_struct.model_input[i]->bytes);
+        TfLiteTensor* input_tensor = model_state_struct.model_input[i];
+        
+        ns_lp_printf("Input tensor %d details:\n", i);
+        ns_lp_printf("  - Data type: %d (0=float32, 1=float16, 2=int32, 3=uint8, 4=int64, 5=string, 6=bool, 7=int16, 8=complex64, 9=int8)\n", 
+                     input_tensor->type);
+        ns_lp_printf("  - Bytes: %d\n", input_tensor->bytes);
+        ns_lp_printf("  - Dimensions: %d\n", input_tensor->dims->size);
+        
+        // Print shape information
+        ns_lp_printf("  - Shape: [");
+        for (int j = 0; j < input_tensor->dims->size; j++) {
+            ns_lp_printf("%d", input_tensor->dims->data[j]);
+            if (j < input_tensor->dims->size - 1) ns_lp_printf(", ");
+        }
+        ns_lp_printf("]\n");
+        
+        // Get quantization parameters if applicable
+        if (input_tensor->quantization.type == kTfLiteAffineQuantization) {
+            TfLiteAffineQuantization* quant = 
+                (TfLiteAffineQuantization*)input_tensor->quantization.params;
+            if (quant && quant->scale && quant->zero_point) {
+                ns_lp_printf("  - Scale: %f\n", quant->scale->data[0]);
+                ns_lp_printf("  - Zero point: %d\n", quant->zero_point->data[0]);
+            }
+        }
+        
+        // Prepare input data based on tensor type
+        switch (input_tensor->type) {
+            case kTfLiteFloat32:
+                // Fill with zeros for float32 tensors
+                memset(input_tensor->data.f, 0, input_tensor->bytes);
+                ns_lp_printf("  - Filled with zeros (float32)\n");
+                break;
+                
+            case kTfLiteInt8:
+                // Fill with zeros for int8 tensors
+                memset(input_tensor->data.int8, 0, input_tensor->bytes);
+                ns_lp_printf("  - Filled with zeros (int8)\n");
+                break;
+                
+            case kTfLiteUInt8:
+                // Fill with zeros for uint8 tensors
+                memset(input_tensor->data.uint8, 0, input_tensor->bytes);
+                ns_lp_printf("  - Filled with zeros (uint8)\n");
+                break;
+                
+            case kTfLiteInt16:
+                // Fill with zeros for int16 tensors
+                memset(input_tensor->data.i16, 0, input_tensor->bytes);
+                ns_lp_printf("  - Filled with zeros (int16)\n");
+                break;
+                
+            default:
+                ns_lp_printf("  - Warning: Unsupported tensor type %d, filling with zeros\n", 
+                             input_tensor->type);
+                memset(input_tensor->data.raw, 0, input_tensor->bytes);
+                break;
+        }
     }
     
     ns_lp_printf("Starting inference...\n");
     // Profile inference
 
-    TfLiteStatus invoke_status = model_state_struct.interpreter->Invoke();
+    // Use the profiling function to get detailed profiling data
+    profiling_result_t result = profile_model_inference(&model_state_struct);
     
-    // ns_lp_printf("Inference complete: cycles=%d, status=%d\n", cycles, invoke_status);
+    // Get the invoke status from the profiling result
+    TfLiteStatus invoke_status = result.invoke_status;
+    uint32_t num_layers = result.num_layers;
     
-    // Send stats over USB (cycles and status)
-    uint8_t stats_packet[8];
-    // memcpy(&stats_packet[0], &cycles, 4);
-    memcpy(&stats_packet[4], &invoke_status, 4);
+    // Temporarily use simple inference to debug memory issue
+    // TfLiteStatus invoke_status = model_state_struct.interpreter->Invoke();
+    // uint32_t num_layers = 0; // Placeholder for now
     
-    ns_lp_printf("Sending stats packet: ");
-    for (int i = 0; i < 8; i++) {
+    // Use the profiling function to get detailed profiling data
+    // profiling_result_t result = profile_model_inference(&model_state_struct);
+    
+    // Get the invoke status from the last inference
+    // TfLiteStatus invoke_status = result.invoke_status;
+    
+    // Capture basic performance metrics
+    uint32_t cycles = 0;
+    #ifndef AM_PART_APOLLO5B
+    cycles = ns_get_perf_cycles();
+    #endif
+    
+    ns_lp_printf("Inference complete: cycles=%d, status=%d, layers=%d\n", cycles, invoke_status, num_layers);
+    
+    // Send enhanced stats over USB (cycles, status, num_layers, arena_used)
+    uint8_t stats_packet[16]; // Increased size to include more data
+    memcpy(&stats_packet[0], &cycles, 4);
+    // Fix TfLiteStatus size issue by casting to uint32_t
+    uint32_t status_value = (uint32_t)invoke_status;
+    memcpy(&stats_packet[4], &status_value, 4);
+    memcpy(&stats_packet[8], &num_layers, 4);
+    memcpy(&stats_packet[12], &model_state_struct.computed_arena_size, 4);
+    
+    ns_lp_printf("Sending enhanced stats packet: ");
+    for (int i = 0; i < 16; i++) {
         ns_lp_printf("0x%02X ", stats_packet[i]);
     }
     ns_lp_printf("\n");
+    ns_lp_printf("Stats: cycles=%d, status=%d, layers=%d, arena_used=%d\n", 
+                 cycles, invoke_status, num_layers, model_state_struct.computed_arena_size);
     
-    webusb_send_data(stats_packet, 8);
-    ns_lp_printf("Stats packet sent\n");
+    webusb_send_data(stats_packet, 16);
+    ns_lp_printf("Enhanced stats packet sent\n");
     ns_lp_printf("=== run_model_and_send_stats complete ===\n");
 }
 

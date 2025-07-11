@@ -87,6 +87,13 @@ typedef struct {
  */
 extern int ns_model_init(ns_model_state_t *ms);
 
+/**
+ * @brief Initialize the model with minimal configuration
+ * @param ms Model state and configuration struct
+ * @return int status
+ */
+extern int ns_model_minimal_init(ns_model_state_t *ms);
+
     #ifdef __cplusplus
 }
     #endif
