@@ -24,9 +24,10 @@
 #include "ns_pmu_map.h"
 #include "ns_power_profile.h"
 
+#include "arrhythmia_model_power_example_tensors.h"
+
 #ifdef NS_MLPROFILE
 #ifdef AM_PART_APOLLO5B
-extern ns_pmu_config_t ns_microProfilerPMU;
 extern ns_profiler_sidecar_t ns_microProfilerSidecar;
 #endif
 #endif
@@ -120,6 +121,13 @@ typedef struct {
     TfLiteStatus invoke_status;
 } profiling_result_t;
 
+// Callback for profiling
+int tf_invoke() {
+    // ns_lp_printf("tf_invoke called\n");
+    model_state_struct.interpreter->Invoke();
+    return 0;
+}
+
 profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
     profiling_result_t result = {0, kTfLiteOk};
     
@@ -167,6 +175,27 @@ profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
         
         ns_lp_printf("Number of layers: %d\n", result.num_layers);
     }
+
+    #ifdef AM_PART_APOLLO5B
+        ns_lp_printf("Full PMU profiling run - will run model many times to capture all PMU counters\n");
+        ns_lp_printf("Each . is an Invoke of the model, capturing 4 distinct PMU counters.\n");
+        
+        // Run the model repeatedly, capturing different PMU every time. The results
+        // will accumulate in the events array (ns_profiler_event_stats_t). Print those 
+        // prettily to the console, up until the limit of the event buffer (4096
+        // events). 
+        //
+        // IMPORTANT: this assumes that every run is identical, which is true for most models,
+        // but not all. Specifically, some models include a CALL_ONCE layer that will only run
+        // the first time the model is invoked. That 'first run' is above, and is already
+        // captured in the event buffer. If the model has a CALL_ONCE layer, the number of layers
+        // will be different for the runs below, so the mapping of PMU events to layers must be 
+        // adjusted.
+
+        ns_characterize_model(tf_invoke);
+        ns_lp_printf("\nPMU profiling .\n");
+        ns_parse_pmu_stats(result.num_layers, model_state->rv_count); // Parse the PMU stats and print them out in CSV format
+    #endif // AM_PART_APOLLO5B
     
     ns_set_power_monitor_state(2); // GPIO 02 indicates profiling complete
     
@@ -287,16 +316,6 @@ void run_model_and_send_stats() {
     model_state_struct.arena = arena;
     model_state_struct.arena_size = ARENA_SIZE;
     
-    // Provide timer for profiling if NS_MLPROFILE is defined
-    #ifdef NS_MLPROFILE
-    static ns_timer_config_t tickTimer = {
-        .api = &ns_timer_V1_0_0,
-        .timer = NS_TIMER_COUNTER,
-        .enableInterrupt = false,
-    };
-    model_state_struct.tickTimer = &tickTimer;
-    #endif
-    
     ns_lp_printf("Initializing model...\n");
     int status = ns_model_minimal_init(&model_state_struct);
     if (status != 0) {
@@ -337,39 +356,48 @@ void run_model_and_send_stats() {
                 ns_lp_printf("  - Zero point: %d\n", quant->zero_point->data[0]);
             }
         }
-        
-        // Prepare input data based on tensor type
-        switch (input_tensor->type) {
-            case kTfLiteFloat32:
-                // Fill with zeros for float32 tensors
-                memset(input_tensor->data.f, 0, input_tensor->bytes);
-                ns_lp_printf("  - Filled with zeros (float32)\n");
-                break;
-                
-            case kTfLiteInt8:
-                // Fill with zeros for int8 tensors
-                memset(input_tensor->data.int8, 0, input_tensor->bytes);
-                ns_lp_printf("  - Filled with zeros (int8)\n");
-                break;
-                
-            case kTfLiteUInt8:
-                // Fill with zeros for uint8 tensors
-                memset(input_tensor->data.uint8, 0, input_tensor->bytes);
-                ns_lp_printf("  - Filled with zeros (uint8)\n");
-                break;
-                
-            case kTfLiteInt16:
-                // Fill with zeros for int16 tensors
-                memset(input_tensor->data.i16, 0, input_tensor->bytes);
-                ns_lp_printf("  - Filled with zeros (int16)\n");
-                break;
-                
-            default:
-                ns_lp_printf("  - Warning: Unsupported tensor type %d, filling with zeros\n", 
-                             input_tensor->type);
-                memset(input_tensor->data.raw, 0, input_tensor->bytes);
-                break;
+
+        // Initialize input tensors
+        int offset = 0;
+        for (uint32_t i = 0; i < model_state_struct.numInputTensors; i++) {
+            memcpy(
+                model_state_struct.model_input[i]->data.int8, ((char *)arrhythmia_model_power_example_input_tensors) + offset,
+                model_state_struct.model_input[i]->bytes);
+            offset += model_state_struct.model_input[i]->bytes;
         }
+        
+        // // Prepare input data based on tensor type
+        // switch (input_tensor->type) {
+        //     case kTfLiteFloat32:
+        //         // Fill with zeros for float32 tensors
+        //         memset(input_tensor->data.f, 1, input_tensor->bytes);
+        //         ns_lp_printf("  - Filled with zeros (float32)\n");
+        //         break;
+                
+        //     case kTfLiteInt8:
+        //         // Fill with zeros for int8 tensors
+        //         memset(input_tensor->data.int8, 1, input_tensor->bytes);
+        //         ns_lp_printf("  - Filled with zeros (int8)\n");
+        //         break;
+                
+        //     case kTfLiteUInt8:
+        //         // Fill with zeros for uint8 tensors
+        //         memset(input_tensor->data.uint8, 1, input_tensor->bytes);
+        //         ns_lp_printf("  - Filled with zeros (uint8)\n");
+        //         break;
+                
+        //     case kTfLiteInt16:
+        //         // Fill with zeros for int16 tensors
+        //         memset(input_tensor->data.i16, 1, input_tensor->bytes);
+        //         ns_lp_printf("  - Filled with zeros (int16)\n");
+        //         break;
+                
+        //     default:
+        //         ns_lp_printf("  - Warning: Unsupported tensor type %d, filling with zeros\n", 
+        //                      input_tensor->type);
+        //         memset(input_tensor->data.raw, 1, input_tensor->bytes);
+        //         break;
+        // }
     }
     
     ns_lp_printf("Starting inference...\n");
