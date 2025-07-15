@@ -6,6 +6,8 @@
 #include "am_util_stdio.h"
 #include "ns_peripherals_button.h"
 #include "ns_peripherals_power.h"
+
+
 #include "ns_ambiqsuite_harness.h"
 #include "ns_perf_profile.h"
 #include "ns_usb.h"
@@ -19,6 +21,7 @@
 #include "ns_model.h"
 
 // Add profiling includes
+#include "ns_core.h"
 #include "ns_energy_monitor.h"
 #include "ns_pmu_utils.h"
 #include "ns_pmu_map.h"
@@ -31,6 +34,10 @@
 extern ns_profiler_sidecar_t ns_microProfilerSidecar;
 #endif
 #endif
+
+// TFLM Config
+static ns_model_state_t model;
+volatile int example_status = 0; // Prevent the compiler from optimizing out while loops
 
 // Message header structure (13 bytes)
 typedef struct {
@@ -62,7 +69,6 @@ static arena_location_t selected_arena_location = ARENA_LOC_TCM;
 #define ARENA_SIZE (128 * 1024) // Increased from 16KB to 64KB for model tensor allocation
 NS_PUT_IN_TCM alignas(16) static uint8_t tcm_arena[ARENA_SIZE];
 AM_SHARED_RW alignas(16) static uint8_t sram_arena[ARENA_SIZE];
-static ns_model_state_t model_state_struct;
 
 // Model upload state
 typedef struct {
@@ -124,7 +130,7 @@ typedef struct {
 // Callback for profiling
 int tf_invoke() {
     // ns_lp_printf("tf_invoke called\n");
-    model_state_struct.interpreter->Invoke();
+    model.interpreter->Invoke();
     return 0;
 }
 
@@ -176,6 +182,8 @@ profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
         ns_lp_printf("Number of layers: %d\n", result.num_layers);
     }
 
+    ns_set_power_monitor_state(2); // GPIO 02 indicates profiling complete
+
     #ifdef AM_PART_APOLLO5B
         ns_lp_printf("Full PMU profiling run - will run model many times to capture all PMU counters\n");
         ns_lp_printf("Each . is an Invoke of the model, capturing 4 distinct PMU counters.\n");
@@ -197,7 +205,7 @@ profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
         ns_parse_pmu_stats(result.num_layers, model_state->rv_count); // Parse the PMU stats and print them out in CSV format
     #endif // AM_PART_APOLLO5B
     
-    ns_set_power_monitor_state(2); // GPIO 02 indicates profiling complete
+    
     
     return result;
 }
@@ -311,13 +319,13 @@ void run_model_and_send_stats() {
     ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_len);
 
     // Fill out model state struct
-    memset(&model_state_struct, 0, sizeof(model_state_struct));
-    model_state_struct.model_array = model_data;
-    model_state_struct.arena = arena;
-    model_state_struct.arena_size = ARENA_SIZE;
+    memset(&model, 0, sizeof(model));
+    model.model_array = model_data;
+    model.arena = arena;
+    model.arena_size = ARENA_SIZE;
     
     ns_lp_printf("Initializing model...\n");
-    int status = ns_model_minimal_init(&model_state_struct);
+    int status = ns_model_minimal_init(&model);
     if (status != 0) {
         ns_lp_printf("Model init failed with status: %d\n", status);
         // Send error response
@@ -327,11 +335,11 @@ void run_model_and_send_stats() {
     }
     
     ns_lp_printf("Model init successful\n");
-    ns_lp_printf("Number of input tensors: %d\n", model_state_struct.numInputTensors);
+    ns_lp_printf("Number of input tensors: %d\n", model.numInputTensors);
     
     // Enhanced input tensor handling
-    for (uint32_t i = 0; i < model_state_struct.numInputTensors; i++) {
-        TfLiteTensor* input_tensor = model_state_struct.model_input[i];
+    for (uint32_t i = 0; i < model.numInputTensors; i++) {
+        TfLiteTensor* input_tensor = model.model_input[i];
         
         ns_lp_printf("Input tensor %d details:\n", i);
         ns_lp_printf("  - Data type: %d (0=float32, 1=float16, 2=int32, 3=uint8, 4=int64, 5=string, 6=bool, 7=int16, 8=complex64, 9=int8)\n", 
@@ -359,11 +367,11 @@ void run_model_and_send_stats() {
 
         // Initialize input tensors
         int offset = 0;
-        for (uint32_t i = 0; i < model_state_struct.numInputTensors; i++) {
+        for (uint32_t i = 0; i < model.numInputTensors; i++) {
             memcpy(
-                model_state_struct.model_input[i]->data.int8, ((char *)arrhythmia_model_power_example_input_tensors) + offset,
-                model_state_struct.model_input[i]->bytes);
-            offset += model_state_struct.model_input[i]->bytes;
+                model.model_input[i]->data.int8, ((char *)arrhythmia_model_power_example_input_tensors) + offset,
+                model.model_input[i]->bytes);
+            offset += model.model_input[i]->bytes;
         }
         
         // // Prepare input data based on tensor type
@@ -404,18 +412,18 @@ void run_model_and_send_stats() {
     // Profile inference
 
     // Use the profiling function to get detailed profiling data
-    profiling_result_t result = profile_model_inference(&model_state_struct);
+    profiling_result_t result = profile_model_inference(&model);
     
     // Get the invoke status from the profiling result
     TfLiteStatus invoke_status = result.invoke_status;
     uint32_t num_layers = result.num_layers;
     
     // Temporarily use simple inference to debug memory issue
-    // TfLiteStatus invoke_status = model_state_struct.interpreter->Invoke();
+    // TfLiteStatus invoke_status = model.interpreter->Invoke();
     // uint32_t num_layers = 0; // Placeholder for now
     
     // Use the profiling function to get detailed profiling data
-    // profiling_result_t result = profile_model_inference(&model_state_struct);
+    // profiling_result_t result = profile_model_inference(&model);
     
     // Get the invoke status from the last inference
     // TfLiteStatus invoke_status = result.invoke_status;
@@ -435,7 +443,7 @@ void run_model_and_send_stats() {
     uint32_t status_value = (uint32_t)invoke_status;
     memcpy(&stats_packet[4], &status_value, 4);
     memcpy(&stats_packet[8], &num_layers, 4);
-    memcpy(&stats_packet[12], &model_state_struct.computed_arena_size, 4);
+    memcpy(&stats_packet[12], &model.computed_arena_size, 4);
     
     ns_lp_printf("Sending enhanced stats packet: ");
     for (int i = 0; i < 16; i++) {
@@ -443,7 +451,7 @@ void run_model_and_send_stats() {
     }
     ns_lp_printf("\n");
     ns_lp_printf("Stats: cycles=%d, status=%d, layers=%d, arena_used=%d\n", 
-                 cycles, invoke_status, num_layers, model_state_struct.computed_arena_size);
+                 cycles, invoke_status, num_layers, model.computed_arena_size);
     
     webusb_send_data(stats_packet, 16);
     ns_lp_printf("Enhanced stats packet sent\n");
@@ -484,7 +492,10 @@ int main(void) {
     usb_handle_t usb_handle = NULL;
 
     ns_core_config_t ns_core_cfg = {.api = &ns_core_V1_0_0};
-    NS_TRY(ns_core_init(&ns_core_cfg), "Core init failed.\b");
+    uint32_t num_layers = 0;
+    char name[50];
+    uint32_t pmu_profile_start_layer = 0;
+    NS_TRY(ns_core_init(&ns_core_cfg), "Core init failed.\n");
 
     ns_power_config(&ns_power_usb);
 
@@ -530,5 +541,6 @@ int main(void) {
 
     vTaskStartScheduler();
     while (1) {
+        // example_status = NS_STATUS_SUCCESS;
     };
 }

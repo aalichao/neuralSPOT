@@ -9,7 +9,15 @@
  *
  */
 
+#ifdef AM_PART_APOLLO5B
+#define NS_PROFILER_PMU_EVENT_0 ARM_PMU_MVE_LDST_MULTI_RETIRED
+#define NS_PROFILER_PMU_EVENT_1 ARM_PMU_MVE_INT_MAC_RETIRED
+#define NS_PROFILER_PMU_EVENT_2 ARM_PMU_INST_RETIRED
+#define NS_PROFILER_PMU_EVENT_3 ARM_PMU_MVE_LD_CONTIG_RETIRED
+#endif
+
 // NS includes
+#include "ns_core.h"
 #include "ns_model.h"
 #include "ns_ambiqsuite_harness.h"
 #include "ns_debug_log.h"
@@ -100,6 +108,7 @@ static constexpr int arrhythmia_model_power_resource_var_arena_size =
     4 * (0 + 1) * sizeof(tflite::MicroResourceVariables);
 alignas(16) static uint8_t arrhythmia_model_power_var_arena[arrhythmia_model_power_resource_var_arena_size];
 
+int ns_model_init(ns_model_state_t *ms);
 
 /**
  * @brief Initialize TF with model using minimal configuration
@@ -162,8 +171,7 @@ ns_model_minimal_init(ns_model_state_t *ms) {
  * handling.
  *
  */
-int
-ns_model_init(ns_model_state_t *ms) {
+int ns_model_init(ns_model_state_t *ms) {
     ms->state = NOT_READY;
 
     tflite::MicroErrorReporter micro_error_reporter;
@@ -206,7 +214,7 @@ ns_model_init(ns_model_state_t *ms) {
 
     // Use a comprehensive op resolver that includes all common ops
     // This ensures compatibility with any TensorFlow Lite model
-    static tflite::MicroMutableOpResolver<112> resolver; // Large enough for most models
+    static tflite::MicroMutableOpResolver<150> resolver; // Large enough for most models
     
     // Set up the resolver with all supported operations
     if (!setup_supported_resolver(resolver)) {
@@ -246,7 +254,7 @@ ns_model_init(ns_model_state_t *ms) {
     if (allocate_status != kTfLiteOk) {
         ns_lp_printf("MODEL FAILURE\n");
         TF_LITE_REPORT_ERROR(ms->error_reporter, "AllocateTensors() failed");
-        ms->computed_arena_size = 0xDEADBEEF;
+        ms->computed_arena_size = ms->interpreter->arena_used_bytes();
         return NS_STATUS_FAILURE;
     }
 
