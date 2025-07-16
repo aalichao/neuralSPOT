@@ -31,6 +31,7 @@
 
 #ifdef NS_MLPROFILE
 #ifdef AM_PART_APOLLO5B
+extern ns_pmu_config_t ns_microProfilerPMU;
 extern ns_profiler_sidecar_t ns_microProfilerSidecar;
 #endif
 #endif
@@ -54,7 +55,7 @@ typedef struct {
 #define CHUNK_CMD_RUN_STATS  0x04
 
 // Maximum model sizes for TCM and SRAM
-#define TCM_MODEL_SIZE  (200 * 1024) // 256KB
+#define TCM_MODEL_SIZE  (250 * 1024) // 256KB
 #define SRAM_MODEL_SIZE (512 * 1024) // 512KB
 
 // Statically allocated model arrays
@@ -66,7 +67,7 @@ typedef enum { ARENA_LOC_TCM = 0, ARENA_LOC_SRAM = 1 } arena_location_t;
 static model_location_t selected_model_location = MODEL_LOC_TCM;
 static arena_location_t selected_arena_location = ARENA_LOC_TCM;
 
-#define ARENA_SIZE (128 * 1024) // Increased from 16KB to 64KB for model tensor allocation
+#define ARENA_SIZE (73 * 1024) // Increased from 16KB to 64KB for model tensor allocation
 NS_PUT_IN_TCM alignas(16) static uint8_t tcm_arena[ARENA_SIZE];
 AM_SHARED_RW alignas(16) static uint8_t sram_arena[ARENA_SIZE];
 
@@ -121,6 +122,20 @@ const ns_power_config_t ns_power_usb = {
     .bNeedITM = true,
     .bNeedXtal = true};
 
+const ns_power_config_t ns_power_measurement = {
+    .api = &ns_power_V1_0_0,
+    .eAIPowerMode = NS_MAXIMUM_PERF,
+    .bNeedAudAdc = false,
+    .bNeedSharedSRAM = true,
+    .bNeedCrypto = false,
+    .bNeedBluetooth = false,
+    .bNeedUSB = false,
+    .bNeedIOM = false,
+    .bNeedAlternativeUART = false,
+    .b128kTCM = false,
+    .bEnableTempCo = false,
+    .bNeedITM = false};
+
 // Profiling function based on tflm_profiling.cc approach
 typedef struct {
     uint32_t num_layers;
@@ -139,7 +154,7 @@ profiling_result_t profile_model_inference(ns_model_state_t *model_state) {
     
     ns_lp_printf("Starting TFLM profiling...\n");
     
-    // Initialize power monitoring
+    // Initialize the model, get handle if successful
     ns_init_power_monitor_state();
     ns_set_power_monitor_state(NS_IDLE);
     
@@ -269,6 +284,7 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
             uint32_t estimated_size = header->total_chunks * payload_length;
             ns_lp_printf("Estimated model size: %d bytes\n", estimated_size);
             uint8_t* model_buffer = (selected_model_location == MODEL_LOC_SRAM) ? sram_model_array : tcm_model_array;
+            // uint8_t* model_buffer = sram_model_array;
             size_t model_buffer_size = (selected_model_location == MODEL_LOC_SRAM) ? SRAM_MODEL_SIZE : TCM_MODEL_SIZE;
             if (estimated_size > model_buffer_size) {
                 ns_lp_printf("Error: Model too large for selected memory\n");
@@ -296,31 +312,34 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
         // ns_lp_printf("Unknown command: %d\n", header->command);
     }
 }
+#include "arrhythmia_model_power_model_data.h"
 
 void run_model_and_send_stats() {
     ns_lp_printf("=== run_model_and_send_stats called ===\n");
     
-    if (!model_state.upload_complete) {
-        ns_lp_printf("Model not uploaded yet\n");
-        // Send error response
-        uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}; // 0 cycles, error status
-        webusb_send_data(error_packet, 8);
-        return;
-    }
+    // if (!model_state.upload_complete) {
+    //     ns_lp_printf("Model not uploaded yet\n");
+    //     // Send error response
+    //     uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}; // 0 cycles, error status
+    //     webusb_send_data(error_packet, 8);
+    //     return;
+    // }
     
     ns_lp_printf("Model upload complete, size: %d bytes\n", model_state.model_size);
     
     // Select model buffer and arena
     uint8_t* model_data = (selected_model_location == MODEL_LOC_SRAM) ? sram_model_array : tcm_model_array;
+    // uint8_t* model_data = sram_model_array;
     size_t model_len = model_state.model_size;
     uint8_t* arena = (selected_arena_location == ARENA_LOC_SRAM) ? sram_arena : tcm_arena;
     
     ns_lp_printf("Using model location: %s\n", selected_model_location == MODEL_LOC_SRAM ? "SRAM" : "TCM");
-    ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_len);
+    // ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_len);
 
     // Fill out model state struct
     memset(&model, 0, sizeof(model));
     model.model_array = model_data;
+    // model.model_array = arrhythmia_model_power_model;
     model.arena = arena;
     model.arena_size = ARENA_SIZE;
     
@@ -373,39 +392,6 @@ void run_model_and_send_stats() {
                 model.model_input[i]->bytes);
             offset += model.model_input[i]->bytes;
         }
-        
-        // // Prepare input data based on tensor type
-        // switch (input_tensor->type) {
-        //     case kTfLiteFloat32:
-        //         // Fill with zeros for float32 tensors
-        //         memset(input_tensor->data.f, 1, input_tensor->bytes);
-        //         ns_lp_printf("  - Filled with zeros (float32)\n");
-        //         break;
-                
-        //     case kTfLiteInt8:
-        //         // Fill with zeros for int8 tensors
-        //         memset(input_tensor->data.int8, 1, input_tensor->bytes);
-        //         ns_lp_printf("  - Filled with zeros (int8)\n");
-        //         break;
-                
-        //     case kTfLiteUInt8:
-        //         // Fill with zeros for uint8 tensors
-        //         memset(input_tensor->data.uint8, 1, input_tensor->bytes);
-        //         ns_lp_printf("  - Filled with zeros (uint8)\n");
-        //         break;
-                
-        //     case kTfLiteInt16:
-        //         // Fill with zeros for int16 tensors
-        //         memset(input_tensor->data.i16, 1, input_tensor->bytes);
-        //         ns_lp_printf("  - Filled with zeros (int16)\n");
-        //         break;
-                
-        //     default:
-        //         ns_lp_printf("  - Warning: Unsupported tensor type %d, filling with zeros\n", 
-        //                      input_tensor->type);
-        //         memset(input_tensor->data.raw, 1, input_tensor->bytes);
-        //         break;
-        // }
     }
     
     ns_lp_printf("Starting inference...\n");
@@ -497,7 +483,9 @@ int main(void) {
     uint32_t pmu_profile_start_layer = 0;
     NS_TRY(ns_core_init(&ns_core_cfg), "Core init failed.\n");
 
-    ns_power_config(&ns_power_usb);
+    // ns_power_config(&ns_power_usb);
+
+    NS_TRY(ns_power_config(&ns_power_measurement), "Power Init Failed.\n");
 
     // Only turn HP while doing codec and AI
     NS_TRY(ns_set_performance_mode(NS_MINIMUM_PERF), "Set CPU Perf mode failed. ");
@@ -505,8 +493,8 @@ int main(void) {
     ns_itm_printf_enable();
     ns_interrupt_master_enable();
 
-    ns_init_perf_profiler();
-    ns_start_perf_profiler();
+    // ns_init_perf_profiler();
+    // ns_start_perf_profiler();
 
     // Initialize the URL descriptor
     strcpy(webusb_url.url, "ambiqai.github.io/web-ble-dashboards/nnse-usb/");
