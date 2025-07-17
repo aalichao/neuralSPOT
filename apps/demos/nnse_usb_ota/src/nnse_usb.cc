@@ -317,13 +317,13 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
 void run_model_and_send_stats() {
     ns_lp_printf("=== run_model_and_send_stats called ===\n");
     
-    // if (!model_state.upload_complete) {
-    //     ns_lp_printf("Model not uploaded yet\n");
-    //     // Send error response
-    //     uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}; // 0 cycles, error status
-    //     webusb_send_data(error_packet, 8);
-    //     return;
-    // }
+    if (!model_state.upload_complete) {
+        ns_lp_printf("Model not uploaded yet\n");
+        // Send error response
+        uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF}; // 0 cycles, error status
+        webusb_send_data(error_packet, 8);
+        return;
+    }
     
     ns_lp_printf("Model upload complete, size: %d bytes\n", model_state.model_size);
     
@@ -487,14 +487,10 @@ int main(void) {
 
     NS_TRY(ns_power_config(&ns_power_measurement), "Power Init Failed.\n");
 
-    // Only turn HP while doing codec and AI
-    NS_TRY(ns_set_performance_mode(NS_MINIMUM_PERF), "Set CPU Perf mode failed. ");
+    NS_TRY(ns_set_performance_mode(NS_MAXIMUM_PERF), "Set CPU Perf mode failed.");
 
     ns_itm_printf_enable();
     ns_interrupt_master_enable();
-
-    // ns_init_perf_profiler();
-    // ns_start_perf_profiler();
 
     // Initialize the URL descriptor
     strcpy(webusb_url.url, "ambiqai.github.io/web-ble-dashboards/nnse-usb/");
