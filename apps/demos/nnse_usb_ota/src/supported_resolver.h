@@ -151,3 +151,4 @@ bool setup_supported_resolver(tflite::MicroMutableOpResolver<N>& resolver) {
 }
 
 #endif // TFLM_OPS_RESOLVER_H 
+
