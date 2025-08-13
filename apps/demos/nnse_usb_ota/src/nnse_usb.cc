@@ -37,6 +37,19 @@ extern ns_profiler_event_stats_t ns_profiler_events_stats[NS_PROFILER_RPC_EVENTS
 #endif
 #endif
 
+// Heap allocation for ns_malloc - similar to RPC examples
+// Apollo510 has 3072KB SRAM, reserve some for system/stack
+#define TOTAL_SRAM_SIZE_KB 3072
+#define RESERVED_SRAM_SIZE_KB 512  // Reserve 512KB for system/stack/other
+#define AVAILABLE_SRAM_SIZE_KB (TOTAL_SRAM_SIZE_KB - RESERVED_SRAM_SIZE_KB)
+#define NS_MALLOC_HEAP_SIZE_IN_K 2048  // 2MB heap for dynamic allocation (needed for large models/arenas)
+
+#if (configAPPLICATION_ALLOCATED_HEAP == 1)
+// ns_malloc uses this heap for dynamic allocation
+size_t ucHeapSize = NS_MALLOC_HEAP_SIZE_IN_K * 1024;
+AM_SHARED_RW uint8_t ucHeap[NS_MALLOC_HEAP_SIZE_IN_K * 1024] __attribute__((aligned(4)));
+#endif
+
 // TFLM Config
 static ns_model_state_t model;
 volatile int example_status = 0; // Prevent the compiler from optimizing out while loops
@@ -59,22 +72,32 @@ typedef struct {
 #define CHUNK_CMD_RUN_STATS  0x04
 #define CHUNK_CMD_PMU_CSV    0x05
 
-// Maximum model sizes for TCM and SRAM
-#define TCM_MODEL_SIZE  (250 * 1024) // 256KB
-#define SRAM_MODEL_SIZE (512 * 1024) // 512KB
+// Memory allocation approach: Static for TCM, Dynamic for SRAM
+#define TCM_MODEL_SIZE  (250 * 1024) // 250KB for TCM model
+#define TCM_ARENA_SIZE  (100 * 1024) // 100KB for TCM arena
 
-// Statically allocated model arrays
+// Static TCM allocations (ns_malloc can't access TCM)
 NS_PUT_IN_TCM alignas(16) static uint8_t tcm_model_array[TCM_MODEL_SIZE];
-AM_SHARED_RW alignas(16) static uint8_t sram_model_array[SRAM_MODEL_SIZE];
+NS_PUT_IN_TCM alignas(16) static uint8_t tcm_arena[TCM_ARENA_SIZE];
+
+// Dynamic SRAM allocations (using ns_malloc) - no static arrays needed
+// These will be allocated dynamically when needed
 
 typedef enum { MODEL_LOC_TCM = 0, MODEL_LOC_SRAM = 1 } model_location_t;
 typedef enum { ARENA_LOC_TCM = 0, ARENA_LOC_SRAM = 1 } arena_location_t;
 static model_location_t selected_model_location = MODEL_LOC_TCM;
 static arena_location_t selected_arena_location = ARENA_LOC_TCM;
 
-#define ARENA_SIZE (73 * 1024) // Increased from 16KB to 64KB for model tensor allocation
-NS_PUT_IN_TCM alignas(16) static uint8_t tcm_arena[ARENA_SIZE];
-AM_SHARED_RW alignas(16) static uint8_t sram_arena[ARENA_SIZE];
+// Dynamic allocation state for SRAM
+typedef struct {
+    uint8_t* model_buffer;
+    uint8_t* arena_buffer;
+    uint32_t model_size;
+    uint32_t arena_size;
+    bool allocated;
+} dynamic_allocation_state_t;
+
+static dynamic_allocation_state_t sram_allocation = {0};
 
 // Model upload state
 typedef struct {
@@ -88,6 +111,145 @@ typedef struct {
 
 // Global model upload state
 static model_upload_state_t model_state = {0};
+
+// Function to allocate model and arena dynamically for SRAM
+bool allocate_sram_model_and_arena(uint32_t model_size) {
+    ns_lp_printf("allocate_sram_model_and_arena: model_size=%d bytes\n", model_size);
+    
+    // Free any existing allocation
+    if (sram_allocation.allocated) {
+        ns_lp_printf("Freeing existing SRAM allocation\n");
+        if (sram_allocation.model_buffer) {
+            ns_free(sram_allocation.model_buffer);
+            sram_allocation.model_buffer = NULL;
+        }
+        if (sram_allocation.arena_buffer) {
+            ns_free(sram_allocation.arena_buffer);
+            sram_allocation.arena_buffer = NULL;
+        }
+        sram_allocation.allocated = false;
+    }
+    
+    // Check if model fits in available SRAM
+    uint32_t available_sram_bytes = AVAILABLE_SRAM_SIZE_KB * 1024;
+    if (model_size > available_sram_bytes) {
+        ns_lp_printf("Error: Model too large for SRAM (%d > %d)\n", model_size, available_sram_bytes);
+        return false;
+    }
+    
+    // Allocate model buffer with fallback
+    ns_lp_printf("Allocating model buffer: %d bytes\n", model_size);
+    sram_allocation.model_buffer = (uint8_t*)ns_malloc(model_size);
+    if (!sram_allocation.model_buffer) {
+        ns_lp_printf("Error: Failed to allocate model buffer\n");
+        return false;
+    }
+    ns_lp_printf("Model buffer allocated at: %p\n", sram_allocation.model_buffer);
+    
+    // Try different arena sizes with fallback
+    uint32_t arena_sizes_to_try[] = {
+        512 * 1024,    // 512KB
+        256 * 1024,    // 256KB
+        128 * 1024,    // 128KB
+        64 * 1024,     // 64KB
+        32 * 1024      // 32KB (minimum)
+    };
+    
+    bool arena_allocated = false;
+    for (int i = 0; i < sizeof(arena_sizes_to_try) / sizeof(arena_sizes_to_try[0]); i++) {
+        uint32_t try_size = arena_sizes_to_try[i];
+        ns_lp_printf("Trying arena size: %d bytes (%d KB)\n", try_size, try_size / 1024);
+        
+        sram_allocation.arena_buffer = (uint8_t*)ns_malloc(try_size);
+        if (sram_allocation.arena_buffer) {
+            sram_allocation.arena_size = try_size;
+            arena_allocated = true;
+            ns_lp_printf("Arena buffer allocated at: %p with size %d bytes\n", 
+                        sram_allocation.arena_buffer, try_size);
+            break;
+        } else {
+            ns_lp_printf("Failed to allocate arena with size %d bytes\n", try_size);
+        }
+    }
+    
+    if (!arena_allocated) {
+        ns_lp_printf("Error: Failed to allocate arena buffer with any size\n");
+        ns_free(sram_allocation.model_buffer);
+        sram_allocation.model_buffer = NULL;
+        return false;
+    }
+    
+    sram_allocation.model_size = model_size;
+    sram_allocation.allocated = true;
+    
+    ns_lp_printf("Successfully allocated in SRAM: model=%d bytes, arena=%d bytes\n", 
+                 model_size, sram_allocation.arena_size);
+    
+    return true;
+}
+
+// Function to allocate only arena in SRAM (when model is in TCM)
+bool allocate_sram_arena_only(uint32_t arena_size) {
+    ns_lp_printf("allocate_sram_arena_only: arena_size=%d bytes\n", arena_size);
+    
+    // Free any existing arena allocation
+    if (sram_allocation.arena_buffer) {
+        ns_free(sram_allocation.arena_buffer);
+        sram_allocation.arena_buffer = NULL;
+    }
+    
+    // Try different arena sizes with fallback (more conservative)
+    uint32_t arena_sizes_to_try[] = {
+        512 * 1024,    // 512KB
+        256 * 1024,    // 256KB
+        128 * 1024,    // 128KB
+        64 * 1024,     // 64KB
+        32 * 1024      // 32KB (minimum)
+    };
+    
+    bool arena_allocated = false;
+    for (int i = 0; i < sizeof(arena_sizes_to_try) / sizeof(arena_sizes_to_try[0]); i++) {
+        uint32_t try_size = arena_sizes_to_try[i];
+        ns_lp_printf("Trying arena size: %d bytes (%d KB)\n", try_size, try_size / 1024);
+        
+        sram_allocation.arena_buffer = (uint8_t*)ns_malloc(try_size);
+        if (sram_allocation.arena_buffer) {
+            sram_allocation.arena_size = try_size;
+            arena_allocated = true;
+            sram_allocation.allocated = true; // Mark as allocated even if model_buffer is NULL
+            ns_lp_printf("Arena buffer allocated at: %p with size %d bytes\n", 
+                        sram_allocation.arena_buffer, try_size);
+            break;
+        } else {
+            ns_lp_printf("Failed to allocate arena with size %d bytes\n", try_size);
+        }
+    }
+    
+    if (!arena_allocated) {
+        ns_lp_printf("Error: Failed to allocate arena buffer with any size\n");
+        return false;
+    }
+    
+    ns_lp_printf("Successfully allocated arena in SRAM: %d bytes\n", sram_allocation.arena_size);
+    
+    return true;
+}
+
+// Function to free SRAM allocations
+void free_sram_allocation() {
+    if (sram_allocation.allocated) {
+        if (sram_allocation.model_buffer) {
+            ns_free(sram_allocation.model_buffer);
+            sram_allocation.model_buffer = NULL;
+        }
+        if (sram_allocation.arena_buffer) {
+            ns_free(sram_allocation.arena_buffer);
+            sram_allocation.arena_buffer = NULL;
+        }
+        sram_allocation.allocated = false;
+        ns_lp_printf("Freed SRAM allocations\n");
+    }
+}
 
 // WebUSB Configuration and Datatypes
 #define MY_RX_BUFSIZE 4096
@@ -226,8 +388,6 @@ profiling_result_t profile_model_inference(ns_model_state_t *model) {
         ns_parse_pmu_stats(result.num_layers, model->rv_count); // Parse the PMU stats and print them out in CSV format
     #endif // AM_PART_APOLLO5B
     
-    
-    
     return result;
 }
 
@@ -285,15 +445,26 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
             ns_lp_printf("Starting model upload: %d chunks\n", model_state.total_chunks);
             uint32_t estimated_size = header->total_chunks * payload_length;
             ns_lp_printf("Estimated model size: %d bytes\n", estimated_size);
-            uint8_t* model_buffer = (selected_model_location == MODEL_LOC_SRAM) ? sram_model_array : tcm_model_array;
-            // uint8_t* model_buffer = sram_model_array;
-            size_t model_buffer_size = (selected_model_location == MODEL_LOC_SRAM) ? SRAM_MODEL_SIZE : TCM_MODEL_SIZE;
-            if (estimated_size > model_buffer_size) {
-                ns_lp_printf("Error: Model too large for selected memory\n");
-                model_state.upload_in_progress = false;
-                return;
+            
+            if (selected_model_location == MODEL_LOC_SRAM) {
+                // Dynamic allocation for SRAM
+                ns_lp_printf("Allocating model and arena in SRAM dynamically\n");
+                if (!allocate_sram_model_and_arena(estimated_size)) {
+                    ns_lp_printf("Error: Failed to allocate memory for model in SRAM\n");
+                    model_state.upload_in_progress = false;
+                    return;
+                }
+                model_state.model_buffer = sram_allocation.model_buffer;
+            } else {
+                // Static allocation for TCM
+                ns_lp_printf("Using static TCM allocation\n");
+                if (estimated_size > TCM_MODEL_SIZE) {
+                    ns_lp_printf("Error: Model too large for TCM (%d > %d)\n", estimated_size, TCM_MODEL_SIZE);
+                    model_state.upload_in_progress = false;
+                    return;
+                }
+                model_state.model_buffer = tcm_model_array;
             }
-            model_state.model_buffer = model_buffer;
             model_state.model_size = estimated_size;
         }
         uint32_t offset = header->chunk_id * (model_state.model_size / model_state.total_chunks);
@@ -314,7 +485,7 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
         // ns_lp_printf("Unknown command: %d\n", header->command);
     }
 }
-#include "arrhythmia_model_power_model_data.h"
+// #include "arrhythmia_model_power_model_data.h"
 
 void run_model_and_send_stats() {
     ns_lp_printf("=== run_model_and_send_stats called ===\n");
@@ -329,21 +500,62 @@ void run_model_and_send_stats() {
     
     ns_lp_printf("Model upload complete, size: %d bytes\n", model_state.model_size);
     
-    // Select model buffer and arena
-    uint8_t* model_data = (selected_model_location == MODEL_LOC_SRAM) ? sram_model_array : tcm_model_array;
-    // uint8_t* model_data = sram_model_array;
-    // size_t model_len = model_state.model_size;
-    uint8_t* arena = (selected_arena_location == ARENA_LOC_SRAM) ? sram_arena : tcm_arena;
+    // Select model buffer and arena based on allocation type
+    uint8_t* model_data;
+    uint8_t* arena;
+    uint32_t arena_size;
+    
+    if (selected_model_location == MODEL_LOC_SRAM) {
+        // Use dynamically allocated SRAM
+        if (!sram_allocation.allocated) {
+            ns_lp_printf("Error: No SRAM allocation found\n");
+            uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
+            webusb_send_data(error_packet, 8);
+            return;
+        }
+        model_data = sram_allocation.model_buffer;
+        
+        if (selected_arena_location == ARENA_LOC_SRAM) {
+            arena = sram_allocation.arena_buffer;
+            arena_size = sram_allocation.arena_size;
+        } else {
+            arena = tcm_arena;
+            arena_size = TCM_ARENA_SIZE;
+        }
+    } else {
+        // Use static TCM allocation
+        model_data = tcm_model_array;
+        
+        if (selected_arena_location == ARENA_LOC_SRAM) {
+            // Need to allocate arena in SRAM
+            if (!sram_allocation.allocated || !sram_allocation.arena_buffer) {
+                ns_lp_printf("Allocating arena in SRAM for TCM model\n");
+                // Let the function try different sizes automatically
+                if (!allocate_sram_arena_only(0)) { // Pass 0 to let function choose size
+                    ns_lp_printf("Error: Failed to allocate arena in SRAM\n");
+                    uint8_t error_packet[8] = {0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF};
+                    webusb_send_data(error_packet, 8);
+                    return;
+                }
+            }
+            arena = sram_allocation.arena_buffer;
+            arena_size = sram_allocation.arena_size;
+        } else {
+            arena = tcm_arena;
+            arena_size = TCM_ARENA_SIZE;
+        }
+    }
     
     ns_lp_printf("Using model location: %s\n", selected_model_location == MODEL_LOC_SRAM ? "SRAM" : "TCM");
-    // ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_len);
+    ns_lp_printf("Using arena location: %s\n", selected_arena_location == ARENA_LOC_SRAM ? "SRAM" : "TCM");
+    ns_lp_printf("Model data pointer: %p, size: %d\n", model_data, model_state.model_size);
+    ns_lp_printf("Arena pointer: %p, size: %d\n", arena, arena_size);
 
     // Fill out model state struct
     memset(&model, 0, sizeof(model));
     model.model_array = model_data;
-    // model.model_array = arrhythmia_model_power_model;
     model.arena = arena;
-    model.arena_size = ARENA_SIZE;
+    model.arena_size = arena_size;
     
     ns_lp_printf("Initializing model...\n");
     int status = ns_model_minimal_init(&model);
@@ -479,11 +691,6 @@ void send_next_pmu_csv_chunk(int chunk_id) {
     packet_len = 2 + 13 + 20 + 4 + row_len;
     ns_lp_printf("Sending PMU CSV row chunk %u, len=%d\n", chunk_id, (int)packet_len);
 
-    // for (uint32_t map_index = 0; map_index < NS_NUM_PMU_MAP_SIZE; map_index++)
-    // {
-    //     ns_lp_printf("%d, ", pmu_event_counters[map_index]);
-    // }
-
     webusb_send_data(packet, packet_len);
 }
 
@@ -537,9 +744,6 @@ int main(void) {
     usb_handle_t usb_handle = NULL;
 
     ns_core_config_t ns_core_cfg = {.api = &ns_core_V1_0_0};
-    uint32_t num_layers = 0;
-    char name[50];
-    uint32_t pmu_profile_start_layer = 0;
     NS_TRY(ns_core_init(&ns_core_cfg), "Core init failed.\n");
 
     // ns_power_config(&ns_power_usb);
@@ -575,7 +779,14 @@ int main(void) {
     model_state.upload_in_progress = false;
     model_state.upload_complete = false;
 
-    ns_lp_printf("Model upload firmware ready\n");
+    // Initialize dynamic allocation state
+    memset(&sram_allocation, 0, sizeof(sram_allocation));
+
+    ns_lp_printf("Model upload firmware ready with hybrid allocation\n");
+    ns_lp_printf("TCM: Static allocation - %d KB model, %d KB arena\n", 
+                 TCM_MODEL_SIZE / 1024, TCM_ARENA_SIZE / 1024);
+    ns_lp_printf("SRAM: Dynamic allocation - up to %d KB available\n", AVAILABLE_SRAM_SIZE_KB);
+    ns_lp_printf("Heap size: %d KB for ns_malloc\n", NS_MALLOC_HEAP_SIZE_IN_K);
     
     // Send a simple heartbeat message to verify USB is working
     uint8_t heartbeat[] = {0x48, 0x45, 0x4C, 0x4C, 0x4F}; // "HELLO"

@@ -1,0 +1,3 @@
+
+
+Local Storage only can save up to 10 MB, so a generated CSV bigger than this wouldn't be ideal. Instead, would need to change approach to break up CSV and JSON representations from the EVB directly and send them in chunks to the browser.

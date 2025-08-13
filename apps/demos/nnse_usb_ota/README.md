@@ -28,10 +28,12 @@ First, flash
 ```bash
 $> make clean
 $> make -j
-$> make TARGET=nnse deploy
+$> make EXAMPLE=demos/nnse_usb_ota MLDEBUG=1 MLPROFILE=1 deploy
 ```
 
-With the firmware deploy, follow this link on a PC using the Chrome browser: [Audio WebBLE Demo](https://ambiqai.github.io/web-ble-dashboards/audio/)
+With the firmware deployed, deploy the browser side by running python -m http.server (port_number) on the web-ble-dashboards github inside of the nnse-usb-ota directory.
+Then go to google chrome and type in localhost:(port_number) into the browser.
+<!-- follow this link on a PC using the Chrome browser: [Audio WebBLE Demo](https://ambiqai.github.io/web-ble-dashboards/audio/) -->
 
 The webpage should look something like this:
 

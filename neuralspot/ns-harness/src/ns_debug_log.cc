@@ -169,7 +169,6 @@ uint32_t ns_set_pmu_header(void) {
     return NS_STATUS_SUCCESS;
 }
 
-
 /**
  * @brief  Retrieves PMU counters for a given layer.
  *
@@ -243,11 +242,22 @@ ns_get_layer_counters(uint32_t layer,
         // ns_lp_printf("Layer %d, map_index %d, index %d, counterValue %d\n", layer, map_index, index, counterValue);
         out_counters[map_index] = counterValue;
     }
+    // for (uint32_t map_index = 0; map_index < NS_NUM_PMU_MAP_SIZE; map_index++) {
+    //     ns_lp_printf("%s,", ns_pmu_map[map_index].regname);
+    // }
+    ns_lp_printf("NS_NUM_PMU_MAP_SIZE: %d\n", NS_NUM_PMU_MAP_SIZE);
 #endif
 #endif
 
     return NS_STATUS_SUCCESS;
 }
+
+// ns_get_pmu_regs(void) {
+//     for (int map_index = 0; map_index < NS_NUM_PMU_MAP_SIZE; map_index++) {
+//         ns_lp_printf("%s, ", ns_pmu_map[map_index].regname);
+//     }
+//     ns_lp_printf("\n");
+// }
 
 /**
  * @brief     Parses and prints performance monitoring unit (PMU) statistics for each layer.
