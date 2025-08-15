@@ -1,3 +1,16 @@
+General Improvements:
+Right now the demo uses raw bytes, however, refactoring it with flatbuffers may be better. 
 
+The performance JSONs are using the percentiles of all values in their respective categories. However, Carlos and Scott said they want to have it highlight areas with high differences between ideal and actual measurements. It may be possible to 
+take the difference of those values and then manually change the color for those nodes. I don't think that thresholds and gradients in the Google Model Explorer JSONs would work, since it uses those for all values, and using those for just the difference
+would mean that the original values would be in a seperate JSON.
 
-Local Storage only can save up to 10 MB, so a generated CSV bigger than this wouldn't be ideal. Instead, would need to change approach to break up CSV and JSON representations from the EVB directly and send them in chunks to the browser.
+Website Considerations:
+Right now, I save the generated CSV to local storage in browser, and then pull from that for the generated CSV and JSON, which is faster and more well-suited for a demo. 
+However, Local Storage only can save up to 10 MB, so a generated CSV bigger than this would lead to failure, and wouldn't be ideal for a website.
+Instead, would need to change approach to break up CSV and JSON representations from the EVB directly and send them in chunks to the browser, which would then be deserialized and then downloaded.
+
+The EVB needs to be reset between model runs due to model uploading taking up the same area as well as the supported resolver being readded (leading to an error) when profiling tflm. The model uploading may be fixed by freeing the memory before 
+uploading a new model and the resolver could be just setup once.
+
+Security-wise, the EVB may need to clear memory (for the models) after a timeout or another step is taken.

@@ -23,6 +23,36 @@
 #include "ns_debug_log.h"
 #include "supported_resolver.h"
 
+// Forward declaration of dynamic derived arrays structure
+typedef struct {
+    uint32_t* mac_estimates;
+    uint32_t* stride_h;
+    uint32_t* stride_w;
+    uint32_t* dilation_h;
+    uint32_t* dilation_w;
+    uint32_t* output_magnitudes;
+    uint32_t* read_estimates;
+    uint32_t* write_estimates;
+    uint32_t* input_magnitudes;
+    uint32_t num_operators;
+    bool allocated;
+} dynamic_derived_arrays_t;
+
+// Forward declaration for dynamic string arrays
+typedef struct {
+    char** mac_strings;
+    char** output_shapes;
+    char** filter_shapes;
+    uint32_t num_operators;
+    bool allocated;
+} dynamic_string_arrays_t;
+
+// External reference to dynamic derived arrays (defined in nnse_usb.cc)
+extern "C" {
+    extern dynamic_derived_arrays_t g_derived_arrays;
+    extern dynamic_string_arrays_t g_string_arrays;
+}
+
 // Tensorflow Lite for Microcontroller includes (somewhat boilerplate)
 // #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/kernels/micro_ops.h"
@@ -50,6 +80,7 @@ ns_timer_config_t basic_tickTimer = {
     .timer = NS_TIMER_COUNTER,
     .enableInterrupt = false,
 };
+
 uint32_t arrhythmia_model_power_mac_estimates[111] = {84000, 60000, 0, 0, 288, 288, 0, 0, 0, 192000, 40000, 0, 512, 512, 0, 0, 0, 256000, 0, 40000, 0, 512, 512, 0, 0, 0, 256000, 0, 24000, 0, 0, 256, 256, 0, 0, 0, 192000, 18000, 0, 576, 576, 0, 0, 0, 288000, 0, 18000, 0, 576, 576, 0, 0, 0, 288000, 0, 18000, 0, 0, 576, 576, 0, 0, 0, 193536, 12096, 0, 1024, 1024, 0, 0, 0, 258048, 0, 12096, 0, 1024, 1024, 0, 0, 0, 258048, 0, 12096, 0, 0, 1024, 1024, 0, 0, 0, 196608, 9216, 0, 2304, 2304, 0, 0, 0, 294912, 0, 9216, 0, 2304, 2304, 0, 0, 0, 294912, 0, 0, 192};
 
 const char* arrhythmia_model_mac_strings[] = {"1*7*1*500*24*1", "1*5*1*500*24", "0", "0", "1*1*1*1*12*24", "1*1*1*1*24*12", "0", "0", "0", "1*1*1*250*32*24", "1*5*1*250*32", "0", "1*1*1*1*16*32", "1*1*1*1*32*16", "0", "0", "0", "1*1*1*250*32*32", "0", "1*5*1*250*32", "0", "1*1*1*1*16*32", "1*1*1*1*32*16", "0", "0", "0", "1*1*1*250*32*32", "0", "1*3*1*250*32", "0", "0", "1*1*1*1*8*32", "1*1*1*1*32*8", "0", "0", "0", "1*1*1*125*48*32", "1*3*1*125*48", "0", "1*1*1*1*12*48", "1*1*1*1*48*12", "0", "0", "0", "1*1*1*125*48*48", "0", "1*3*1*125*48", "0", "1*1*1*1*12*48", "1*1*1*1*48*12", "0", "0", "0", "1*1*1*125*48*48", "0", "1*3*1*125*48", "0", "0", "1*1*1*1*12*48", "1*1*1*1*48*12", "0", "0", "0", "1*1*1*63*64*48", "1*3*1*63*64", "0", "1*1*1*1*16*64", "1*1*1*1*64*16", "0", "0", "0", "1*1*1*63*64*64", "0", "1*3*1*63*64", "0", "1*1*1*1*16*64", "1*1*1*1*64*16", "0", "0", "0", "1*1*1*63*64*64", "0", "1*3*1*63*64", "0", "0", "1*1*1*1*16*64", "1*1*1*1*64*16", "0", "0", "0", "1*1*1*32*96*64", "1*3*1*32*96", "0", "1*1*1*1*24*96", "1*1*1*1*96*24", "0", "0", "0", "1*1*1*32*96*96", "0", "1*3*1*32*96", "0", "1*1*1*1*24*96", "1*1*1*1*96*24", "0", "0", "0", "1*1*1*32*96*96", "0", "0", "96*1*2", };
@@ -63,6 +94,11 @@ const char* arrhythmia_model_mac_filter_shapes[] = {"24*1*7*1", "1*1*5*24", "0*0
 const uint32_t arrhythmia_model_write_estimate[] = {12000, 12000, 6000, 24, 12, 24, 24, 24, 6000, 8000, 8000, 32, 16, 32, 32, 32, 8000, 8000, 8000, 8000, 32, 16, 32, 32, 32, 8000, 8000, 8000, 8000, 4000, 32, 8, 32, 32, 32, 4000, 6000, 6000, 48, 12, 48, 48, 48, 6000, 6000, 6000, 6000, 48, 12, 48, 48, 48, 6000, 6000, 6000, 6000, 3024, 48, 12, 48, 48, 48, 3024, 4032, 4032, 64, 16, 64, 64, 64, 4032, 4032, 4032, 4032, 64, 16, 64, 64, 64, 4032, 4032, 4032, 4032, 2048, 64, 16, 64, 64, 64, 2048, 3072, 3072, 96, 24, 96, 96, 96, 3072, 3072, 3072, 3072, 96, 24, 96, 96, 96, 3072, 3072, 3072, 96, 2, };
 const uint32_t arrhythmia_model_read_estimate[] = {3500, 60000, 12000, 6000, 24, 12, 24, 24, 6000, 6000, 40000, 8000, 32, 16, 32, 32, 8000, 8000, 8000, 40000, 8000, 32, 16, 32, 32, 8000, 8000, 8000, 24000, 8000, 4000, 32, 8, 32, 32, 4000, 4000, 18000, 6000, 48, 12, 48, 48, 6000, 6000, 6000, 18000, 6000, 48, 12, 48, 48, 6000, 6000, 6000, 18000, 6000, 3024, 48, 12, 48, 48, 3024, 3024, 12096, 4032, 64, 16, 64, 64, 4032, 4032, 4032, 12096, 4032, 64, 16, 64, 64, 4032, 4032, 4032, 12096, 4032, 2048, 64, 16, 64, 64, 2048, 2048, 9216, 3072, 96, 24, 96, 96, 3072, 3072, 3072, 9216, 3072, 96, 24, 96, 96, 3072, 3072, 3072, 3072, 192, };
 
+// const uint32_t arrhythmia_model_stride_h[] = {1, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
+// const uint32_t arrhythmia_model_stride_w[] = {2, 1, 2, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 2, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 2, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 2, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
+// const uint32_t arrhythmia_model_dilation_h[] = {1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
+// const uint32_t arrhythmia_model_dilation_w[] = {1, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0};
+
 ns_perf_mac_count_t basic_mac = {
     .number_of_layers = 111, 
     .mac_count_map = arrhythmia_model_power_mac_estimates,
@@ -75,6 +111,55 @@ ns_perf_mac_count_t basic_mac = {
     .output_shapes = (const char **)arrhythmia_model_output_shapes,
     .filter_shapes = (const char **)arrhythmia_model_mac_filter_shapes
 };
+
+// Function to get MAC estimates (dynamic or static)
+ns_perf_mac_count_t* get_mac_estimates() {
+    static ns_perf_mac_count_t dynamic_mac = {0};
+    static ns_perf_mac_count_t static_mac = {
+        .number_of_layers = 111, 
+        .mac_count_map = arrhythmia_model_power_mac_estimates,
+        .output_magnitudes = (uint32_t *)arrhythmia_model_output_magnitudes,
+        .stride_h = (uint32_t *)arrhythmia_model_stride_h,
+        .stride_w = (uint32_t *)arrhythmia_model_stride_w,
+        .dilation_h = (uint32_t *)arrhythmia_model_dilation_h,
+        .dilation_w = (uint32_t *)arrhythmia_model_dilation_w,
+        .mac_compute_string = (const char **)arrhythmia_model_mac_strings,
+        .output_shapes = (const char **)arrhythmia_model_output_shapes,
+        .filter_shapes = (const char **)arrhythmia_model_mac_filter_shapes
+    };
+    
+            // Use dynamic arrays if available, otherwise fall back to static arrays
+        if (g_derived_arrays.allocated && g_derived_arrays.num_operators > 0) {
+            printf("TFLM Profiling: Using DYNAMIC derived arrays (%u operators)\n", g_derived_arrays.num_operators);
+            printf("Dynamic MAC estimates pointer: %p\n", g_derived_arrays.mac_estimates);
+            printf("Dynamic Stride H pointer: %p\n", g_derived_arrays.stride_h);
+            
+            dynamic_mac.number_of_layers = g_derived_arrays.num_operators;
+            dynamic_mac.mac_count_map = g_derived_arrays.mac_estimates;
+            dynamic_mac.output_magnitudes = g_derived_arrays.output_magnitudes;
+            dynamic_mac.stride_h = g_derived_arrays.stride_h;
+            dynamic_mac.stride_w = g_derived_arrays.stride_w;
+            dynamic_mac.dilation_h = g_derived_arrays.dilation_h;
+            dynamic_mac.dilation_w = g_derived_arrays.dilation_w;
+            
+            // Use dynamic string arrays if available, otherwise fall back to static strings
+            if (g_string_arrays.allocated && g_string_arrays.num_operators > 0) {
+                printf("TFLM Profiling: Using DYNAMIC string arrays (%u operators)\n", g_string_arrays.num_operators);
+                dynamic_mac.mac_compute_string = (const char **)g_string_arrays.mac_strings;
+                dynamic_mac.output_shapes = (const char **)g_string_arrays.output_shapes;
+                dynamic_mac.filter_shapes = (const char **)g_string_arrays.filter_shapes;
+            } else {
+                printf("TFLM Profiling: Using STATIC string arrays (fallback)\n");
+                dynamic_mac.mac_compute_string = (const char **)arrhythmia_model_mac_strings;
+                dynamic_mac.output_shapes = (const char **)arrhythmia_model_output_shapes;
+                dynamic_mac.filter_shapes = (const char **)arrhythmia_model_mac_filter_shapes;
+            }
+            return &dynamic_mac;
+    } else {
+        printf("TFLM Profiling: Using STATIC hardcoded arrays (111 operators)\n");
+        return &static_mac;
+    }
+}
 
 #ifdef AM_PART_APOLLO5B
 ns_pmu_config_t basic_pmu_cfg;
@@ -110,7 +195,7 @@ ns_model_minimal_init(ns_model_state_t *ms) {
 
 #ifdef NS_MLPROFILE
     ms->tickTimer = &basic_tickTimer;
-    ms->mac_estimates = &basic_mac;
+    ms->mac_estimates = get_mac_estimates();
     #ifdef AM_PART_APOLLO5B
 
     // PMU config for profiling

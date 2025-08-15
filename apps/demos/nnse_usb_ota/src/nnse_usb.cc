@@ -71,6 +71,8 @@ typedef struct {
 #define CHUNK_CMD_CONFIG     0x03
 #define CHUNK_CMD_RUN_STATS  0x04
 #define CHUNK_CMD_PMU_CSV    0x05
+#define CHUNK_CMD_DERIVED_ARRAYS 0x06
+#define CHUNK_CMD_STRING_ARRAYS 0x07
 
 // Memory allocation approach: Static for TCM, Dynamic for SRAM
 #define TCM_MODEL_SIZE  (250 * 1024) // 250KB for TCM model
@@ -98,6 +100,32 @@ typedef struct {
 } dynamic_allocation_state_t;
 
 static dynamic_allocation_state_t sram_allocation = {0};
+
+// Dynamic derived arrays storage (replaces hardcoded arrays)
+typedef struct {
+    uint32_t* mac_estimates;
+    uint32_t* stride_h;
+    uint32_t* stride_w;
+    uint32_t* dilation_h;
+    uint32_t* dilation_w;
+    uint32_t* output_magnitudes;
+    uint32_t* read_estimates;
+    uint32_t* write_estimates;
+    uint32_t* input_magnitudes;
+    uint32_t num_operators;
+    bool allocated;
+} dynamic_derived_arrays_t;
+
+typedef struct {
+    char** mac_strings;
+    char** output_shapes;
+    char** filter_shapes;
+    uint32_t num_operators;
+    bool allocated;
+} dynamic_string_arrays_t;
+
+dynamic_derived_arrays_t g_derived_arrays = {0};
+dynamic_string_arrays_t g_string_arrays = {0};
 
 // Model upload state
 typedef struct {
@@ -233,6 +261,51 @@ bool allocate_sram_arena_only(uint32_t arena_size) {
     ns_lp_printf("Successfully allocated arena in SRAM: %d bytes\n", sram_allocation.arena_size);
     
     return true;
+}
+
+// Function to free derived arrays
+void free_derived_arrays() {
+    if (g_derived_arrays.allocated) {
+        if (g_derived_arrays.mac_estimates) {
+            ns_free(g_derived_arrays.mac_estimates);
+            g_derived_arrays.mac_estimates = NULL;
+        }
+        if (g_derived_arrays.stride_h) {
+            ns_free(g_derived_arrays.stride_h);
+            g_derived_arrays.stride_h = NULL;
+        }
+        if (g_derived_arrays.stride_w) {
+            ns_free(g_derived_arrays.stride_w);
+            g_derived_arrays.stride_w = NULL;
+        }
+        if (g_derived_arrays.dilation_h) {
+            ns_free(g_derived_arrays.dilation_h);
+            g_derived_arrays.dilation_h = NULL;
+        }
+        if (g_derived_arrays.dilation_w) {
+            ns_free(g_derived_arrays.dilation_w);
+            g_derived_arrays.dilation_w = NULL;
+        }
+        if (g_derived_arrays.output_magnitudes) {
+            ns_free(g_derived_arrays.output_magnitudes);
+            g_derived_arrays.output_magnitudes = NULL;
+        }
+        if (g_derived_arrays.read_estimates) {
+            ns_free(g_derived_arrays.read_estimates);
+            g_derived_arrays.read_estimates = NULL;
+        }
+        if (g_derived_arrays.write_estimates) {
+            ns_free(g_derived_arrays.write_estimates);
+            g_derived_arrays.write_estimates = NULL;
+        }
+        if (g_derived_arrays.input_magnitudes) {
+            ns_free(g_derived_arrays.input_magnitudes);
+            g_derived_arrays.input_magnitudes = NULL;
+        }
+        g_derived_arrays.allocated = false;
+        g_derived_arrays.num_operators = 0;
+        ns_lp_printf("Freed derived arrays\n");
+    }
 }
 
 // Function to free SRAM allocations
@@ -400,8 +473,426 @@ void sendAck(uint32_t chunk_id) {
     ack[2] = (uint8_t)((chunk_id >> 8) & 0xFF);
     ack[3] = (uint8_t)((chunk_id >> 16) & 0xFF);
     ack[4] = (uint8_t)((chunk_id >> 24) & 0xFF);
-    // ns_lp_printf("Sending ACK bytes: 0x%02X %08X\n", ack[0], chunk_id);
+    ns_lp_printf("sendAck: Sending ACK bytes: 0x%02X %08X\n", ack[0], chunk_id);
     webusb_send_data(ack, 5);
+    ns_lp_printf("sendAck: ACK sent successfully\n");
+}
+
+// Handle derived arrays message (chunked)
+void handle_derived_arrays(const uint8_t* data, uint32_t length) {
+    if (length < 21) { // 8 bytes for metadata + at least 8 bytes for one operator
+        ns_lp_printf("Error: Derived arrays message too short\n");
+        return;
+    }
+    
+    // Parse header
+    const usb_message_header_t* header = (const usb_message_header_t*)data;
+    const uint8_t* payload = data + 13;
+    uint32_t payload_length = length - 13;
+    
+    ns_lp_printf("Received derived arrays chunk %u/%u: payload_length=%u\n", 
+                 header->chunk_id, header->total_chunks, payload_length);
+    
+    // Parse chunk metadata
+    uint32_t total_operators = *(uint32_t*)payload;
+    uint32_t operators_in_chunk = *(uint32_t*)(payload + 4);
+    
+    // Calculate chunk start index based on payload size (same as JavaScript)
+    const uint32_t CHUNK_SIZE = 480;
+    const uint32_t METADATA_SIZE = 8;
+    const uint32_t OPERATOR_DATA_SIZE = 36; // Updated to match new payload size
+    const uint32_t MAX_OPERATORS_PER_CHUNK = (CHUNK_SIZE - METADATA_SIZE) / OPERATOR_DATA_SIZE;
+    uint32_t chunk_start_idx = header->chunk_id * MAX_OPERATORS_PER_CHUNK;
+    
+    ns_lp_printf("Chunk metadata: total_ops=%u, chunk_ops=%u, start_idx=%u (max_ops_per_chunk=%u)\n", 
+                 total_operators, operators_in_chunk, chunk_start_idx, MAX_OPERATORS_PER_CHUNK);
+    ns_lp_printf("Chunking: CHUNK_SIZE=%u, METADATA_SIZE=%u, OPERATOR_DATA_SIZE=%u, MAX_OPERATORS_PER_CHUNK=%u\n",
+                 CHUNK_SIZE, METADATA_SIZE, OPERATOR_DATA_SIZE, MAX_OPERATORS_PER_CHUNK);
+    
+    // Calculate expected payload size: 8 bytes for metadata + 36 bytes per operator (9 values * 4 bytes each)
+    uint32_t expected_size = 8 + operators_in_chunk * 36;
+    if (payload_length < expected_size) {
+        ns_lp_printf("Error: Payload too small for %u operators in chunk (need %u, got %u)\n", 
+                     operators_in_chunk, expected_size, payload_length);
+        return;
+    }
+    
+    // Allocate arrays on first chunk (chunk 0)
+    if (header->chunk_id == 0) {
+        // Free any existing allocation
+        if (g_derived_arrays.allocated) {
+            ns_lp_printf("Freeing existing derived arrays allocation\n");
+            if (g_derived_arrays.mac_estimates) {
+                ns_free(g_derived_arrays.mac_estimates);
+                g_derived_arrays.mac_estimates = NULL;
+            }
+            if (g_derived_arrays.stride_h) {
+                ns_free(g_derived_arrays.stride_h);
+                g_derived_arrays.stride_h = NULL;
+            }
+            if (g_derived_arrays.stride_w) {
+                ns_free(g_derived_arrays.stride_w);
+                g_derived_arrays.stride_w = NULL;
+            }
+            if (g_derived_arrays.dilation_h) {
+                ns_free(g_derived_arrays.dilation_h);
+                g_derived_arrays.dilation_h = NULL;
+            }
+            if (g_derived_arrays.dilation_w) {
+                ns_free(g_derived_arrays.dilation_w);
+                g_derived_arrays.dilation_w = NULL;
+            }
+            if (g_derived_arrays.output_magnitudes) {
+                ns_free(g_derived_arrays.output_magnitudes);
+                g_derived_arrays.output_magnitudes = NULL;
+            }
+            if (g_derived_arrays.read_estimates) {
+                ns_free(g_derived_arrays.read_estimates);
+                g_derived_arrays.read_estimates = NULL;
+            }
+            if (g_derived_arrays.write_estimates) {
+                ns_free(g_derived_arrays.write_estimates);
+                g_derived_arrays.write_estimates = NULL;
+            }
+            if (g_derived_arrays.input_magnitudes) {
+                ns_free(g_derived_arrays.input_magnitudes);
+                g_derived_arrays.input_magnitudes = NULL;
+            }
+            g_derived_arrays.allocated = false;
+        }
+        
+        // Allocate arrays for total number of operators
+        g_derived_arrays.mac_estimates = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.stride_h = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.stride_w = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.dilation_h = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.dilation_w = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.output_magnitudes = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.read_estimates = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.write_estimates = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+        g_derived_arrays.input_magnitudes = (uint32_t*)ns_malloc(total_operators * sizeof(uint32_t));
+    
+        // Check if all allocations succeeded
+        if (!g_derived_arrays.mac_estimates || !g_derived_arrays.stride_h || 
+            !g_derived_arrays.stride_w || !g_derived_arrays.dilation_h || 
+            !g_derived_arrays.dilation_w || !g_derived_arrays.output_magnitudes ||
+            !g_derived_arrays.read_estimates || !g_derived_arrays.write_estimates ||
+            !g_derived_arrays.input_magnitudes) {
+            ns_lp_printf("Error: Failed to allocate derived arrays\n");
+            // Free any successful allocations
+            if (g_derived_arrays.mac_estimates) ns_free(g_derived_arrays.mac_estimates);
+            if (g_derived_arrays.stride_h) ns_free(g_derived_arrays.stride_h);
+            if (g_derived_arrays.stride_w) ns_free(g_derived_arrays.stride_w);
+            if (g_derived_arrays.dilation_h) ns_free(g_derived_arrays.dilation_h);
+            if (g_derived_arrays.dilation_w) ns_free(g_derived_arrays.dilation_w);
+            if (g_derived_arrays.output_magnitudes) ns_free(g_derived_arrays.output_magnitudes);
+            if (g_derived_arrays.read_estimates) ns_free(g_derived_arrays.read_estimates);
+            if (g_derived_arrays.write_estimates) ns_free(g_derived_arrays.write_estimates);
+            if (g_derived_arrays.input_magnitudes) ns_free(g_derived_arrays.input_magnitudes);
+            return;
+        }
+        
+        g_derived_arrays.num_operators = total_operators;
+        g_derived_arrays.allocated = true;
+        ns_lp_printf("Allocated derived arrays for %u total operators\n", total_operators);
+    }
+    
+    // Parse chunk data into the correct positions
+    ns_lp_printf("Parsing chunk data for %u operators\n", operators_in_chunk);
+    
+    // Check if arrays are properly allocated
+    if (!g_derived_arrays.allocated || !g_derived_arrays.mac_estimates || !g_derived_arrays.stride_h) {
+        ns_lp_printf("Error: Derived arrays not properly allocated\n");
+        return;
+    }
+    
+    uint32_t offset = 8; // Skip metadata (total_ops + chunk_ops)
+    
+    // Add bounds checking to prevent crashes
+    if (offset + operators_in_chunk * 36 > payload_length) {
+        ns_lp_printf("Error: Payload too small for parsing %u operators\n", operators_in_chunk);
+        return;
+    }
+    
+    for (uint32_t i = 0; i < operators_in_chunk; i++) {
+        uint32_t op_idx = chunk_start_idx + i;
+        
+        // Bounds check for array access
+        if (op_idx >= total_operators) {
+            ns_lp_printf("Error: Operator index %u out of bounds (total: %u)\n", op_idx, total_operators);
+            return;
+        }
+        
+        // Bounds check for payload access
+        if (offset + 36 > payload_length) {
+            ns_lp_printf("Error: Payload access out of bounds at offset %u\n", offset);
+            return;
+        }
+        
+        g_derived_arrays.mac_estimates[op_idx] = *(uint32_t*)(payload + offset);
+        g_derived_arrays.stride_h[op_idx] = *(uint32_t*)(payload + offset + 4);
+        g_derived_arrays.stride_w[op_idx] = *(uint32_t*)(payload + offset + 8);
+        g_derived_arrays.dilation_h[op_idx] = *(uint32_t*)(payload + offset + 12);
+        g_derived_arrays.dilation_w[op_idx] = *(uint32_t*)(payload + offset + 16);
+        g_derived_arrays.output_magnitudes[op_idx] = *(uint32_t*)(payload + offset + 20);
+        g_derived_arrays.read_estimates[op_idx] = *(uint32_t*)(payload + offset + 24);
+        g_derived_arrays.write_estimates[op_idx] = *(uint32_t*)(payload + offset + 28);
+        g_derived_arrays.input_magnitudes[op_idx] = *(uint32_t*)(payload + offset + 32);
+        offset += 36;
+        
+        // Debug: print first few values
+        if (i < 3) {
+            ns_lp_printf("  Op %u: MAC=%u, StrideH=%u, StrideW=%u, DilationH=%u, DilationW=%u\n", op_idx, 
+                        g_derived_arrays.mac_estimates[op_idx], 
+                        g_derived_arrays.stride_h[op_idx],
+                        g_derived_arrays.stride_w[op_idx],
+                        g_derived_arrays.dilation_h[op_idx],
+                        g_derived_arrays.dilation_w[op_idx]);
+        }
+    }
+    ns_lp_printf("Finished parsing chunk data\n");
+    
+    // All values are now received from the payload, no defaults needed
+    
+    // Send ACK for this chunk
+    ns_lp_printf("About to send ACK for derived arrays chunk %u\n", header->chunk_id);
+    sendAck(header->chunk_id);
+    ns_lp_printf("ACK sent for derived arrays chunk %u\n", header->chunk_id);
+    
+    // Check if this is the last chunk
+    if (header->chunk_id == header->total_chunks - 1) {
+        ns_lp_printf("Successfully received all derived arrays chunks for %u operators\n", total_operators);
+        ns_lp_printf("First few MAC estimates: %u, %u, %u\n", 
+                     g_derived_arrays.mac_estimates[0], 
+                     g_derived_arrays.mac_estimates[1], 
+                     g_derived_arrays.mac_estimates[2]);
+        
+        // Print a summary of the derived arrays for TFLM profiling
+        ns_lp_printf("=== DERIVED ARRAYS SUMMARY ===\n");
+        ns_lp_printf("Total operators: %u\n", g_derived_arrays.num_operators);
+        ns_lp_printf("Arrays allocated: %s\n", g_derived_arrays.allocated ? "YES" : "NO");
+        ns_lp_printf("MAC estimates array: %p\n", g_derived_arrays.mac_estimates);
+        ns_lp_printf("Stride H array: %p\n", g_derived_arrays.stride_h);
+        ns_lp_printf("Stride W array: %p\n", g_derived_arrays.stride_w);
+        ns_lp_printf("Dilation H array: %p\n", g_derived_arrays.dilation_h);
+        ns_lp_printf("Dilation W array: %p\n", g_derived_arrays.dilation_w);
+        ns_lp_printf("Output magnitudes array: %p\n", g_derived_arrays.output_magnitudes);
+        ns_lp_printf("Read estimates array: %p\n", g_derived_arrays.read_estimates);
+        ns_lp_printf("Write estimates array: %p\n", g_derived_arrays.write_estimates);
+        ns_lp_printf("Input magnitudes array: %p\n", g_derived_arrays.input_magnitudes);
+        
+        // Print first 10 MAC estimates
+        ns_lp_printf("First 10 MAC estimates: ");
+        for (uint32_t i = 0; i < 10 && i < g_derived_arrays.num_operators; i++) {
+            ns_lp_printf("%u ", g_derived_arrays.mac_estimates[i]);
+        }
+        ns_lp_printf("\n");
+        
+        // Print first 10 Stride H values
+        ns_lp_printf("First 10 Stride H values: ");
+        for (uint32_t i = 0; i < 10 && i < g_derived_arrays.num_operators; i++) {
+            ns_lp_printf("%u ", g_derived_arrays.stride_h[i]);
+        }
+        ns_lp_printf("\n");
+        
+        // Print last 5 MAC estimates
+        if (g_derived_arrays.num_operators > 5) {
+            ns_lp_printf("Last 5 MAC estimates: ");
+            for (uint32_t i = g_derived_arrays.num_operators - 5; i < g_derived_arrays.num_operators; i++) {
+                ns_lp_printf("%u ", g_derived_arrays.mac_estimates[i]);
+            }
+            ns_lp_printf("\n");
+        }
+        
+        ns_lp_printf("=== END DERIVED ARRAYS SUMMARY ===\n");
+    }
+}
+
+// Handle string arrays message (chunked)
+void handle_string_arrays(const uint8_t* data, uint32_t length) {
+    if (length < 21) { // 13 bytes for header + 8 bytes for metadata
+        ns_lp_printf("Error: String arrays message too short\n");
+        return;
+    }
+    
+    // Parse header
+    const usb_message_header_t* header = (const usb_message_header_t*)data;
+    const uint8_t* payload = data + 13;
+    uint32_t payload_length = length - 13;
+    
+    ns_lp_printf("Received string arrays chunk %u/%u: payload_length=%u\n", 
+                 header->chunk_id, header->total_chunks, payload_length);
+    
+    // Parse chunk metadata
+    uint32_t total_operators = *(uint32_t*)payload;
+    uint32_t operators_in_chunk = *(uint32_t*)(payload + 4);
+    
+    ns_lp_printf("String arrays chunk metadata: total_ops=%u, chunk_ops=%u\n", 
+                 total_operators, operators_in_chunk);
+    
+    // Calculate chunk start index (same logic as derived arrays)
+    const uint32_t CHUNK_SIZE = 480;
+    const uint32_t METADATA_SIZE = 8;
+    // Use the same fixed chunking as JavaScript
+    const uint32_t MAX_OPERATORS_PER_CHUNK = 8; // Fixed conservative value
+    uint32_t chunk_start_idx = header->chunk_id * MAX_OPERATORS_PER_CHUNK;
+    
+    ns_lp_printf("String arrays chunking: start_idx=%u, max_ops_per_chunk=%u\n", 
+                 chunk_start_idx, MAX_OPERATORS_PER_CHUNK);
+    
+    // Allocate arrays on first chunk (chunk 0)
+    if (header->chunk_id == 0) {
+        // Free any existing string arrays
+        if (g_string_arrays.allocated) {
+            for (uint32_t i = 0; i < g_string_arrays.num_operators; i++) {
+                if (g_string_arrays.mac_strings[i]) ns_free(g_string_arrays.mac_strings[i]);
+                if (g_string_arrays.output_shapes[i]) ns_free(g_string_arrays.output_shapes[i]);
+                if (g_string_arrays.filter_shapes[i]) ns_free(g_string_arrays.filter_shapes[i]);
+            }
+            if (g_string_arrays.mac_strings) ns_free(g_string_arrays.mac_strings);
+            if (g_string_arrays.output_shapes) ns_free(g_string_arrays.output_shapes);
+            if (g_string_arrays.filter_shapes) ns_free(g_string_arrays.filter_shapes);
+            g_string_arrays.allocated = false;
+        }
+        
+        // Allocate string arrays for total number of operators
+        g_string_arrays.mac_strings = (char**)ns_malloc(total_operators * sizeof(char*));
+        g_string_arrays.output_shapes = (char**)ns_malloc(total_operators * sizeof(char*));
+        g_string_arrays.filter_shapes = (char**)ns_malloc(total_operators * sizeof(char*));
+        
+        if (!g_string_arrays.mac_strings || !g_string_arrays.output_shapes || !g_string_arrays.filter_shapes) {
+            ns_lp_printf("Error: Failed to allocate string arrays\n");
+            return;
+        }
+        
+        // Initialize pointers
+        for (uint32_t i = 0; i < total_operators; i++) {
+            g_string_arrays.mac_strings[i] = NULL;
+            g_string_arrays.output_shapes[i] = NULL;
+            g_string_arrays.filter_shapes[i] = NULL;
+        }
+        
+        g_string_arrays.num_operators = total_operators;
+        g_string_arrays.allocated = true;
+        ns_lp_printf("Allocated string arrays for %u total operators\n", total_operators);
+    }
+    
+    // Check if arrays are properly allocated
+    if (!g_string_arrays.allocated || !g_string_arrays.mac_strings || !g_string_arrays.output_shapes || !g_string_arrays.filter_shapes) {
+        ns_lp_printf("Error: String arrays not properly allocated\n");
+        return;
+    }
+    
+    // Parse strings from payload
+    uint32_t offset = 8; // Skip metadata (total_ops + chunk_ops)
+    
+    ns_lp_printf("Parsing string arrays chunk data for %u operators\n", operators_in_chunk);
+    
+    for (uint32_t i = 0; i < operators_in_chunk; i++) {
+        uint32_t op_idx = chunk_start_idx + i;
+        
+        // Bounds check for array access
+        if (op_idx >= total_operators) {
+            ns_lp_printf("Error: String array operator index %u out of bounds (total: %u)\n", op_idx, total_operators);
+            return;
+        }
+        // Parse MAC string
+        if (offset + 4 > payload_length) {
+            ns_lp_printf("Error: Payload too small for MAC string %u\n", i);
+            return;
+        }
+        uint32_t mac_len = *(uint32_t*)(payload + offset);
+        offset += 4;
+        
+        if (offset + mac_len > payload_length) {
+            ns_lp_printf("Error: MAC string %u out of bounds\n", i);
+            return;
+        }
+        
+        g_string_arrays.mac_strings[op_idx] = (char*)ns_malloc(mac_len + 1);
+        if (g_string_arrays.mac_strings[op_idx]) {
+            memcpy(g_string_arrays.mac_strings[op_idx], payload + offset, mac_len);
+            g_string_arrays.mac_strings[op_idx][mac_len] = '\0';
+        }
+        offset += mac_len;
+        
+        // Parse output shape string
+        if (offset + 4 > payload_length) {
+            ns_lp_printf("Error: Payload too small for output shape string %u\n", i);
+            return;
+        }
+        uint32_t output_len = *(uint32_t*)(payload + offset);
+        offset += 4;
+        
+        if (offset + output_len > payload_length) {
+            ns_lp_printf("Error: Output shape string %u out of bounds\n", i);
+            return;
+        }
+        
+        g_string_arrays.output_shapes[op_idx] = (char*)ns_malloc(output_len + 1);
+        if (g_string_arrays.output_shapes[op_idx]) {
+            memcpy(g_string_arrays.output_shapes[op_idx], payload + offset, output_len);
+            g_string_arrays.output_shapes[op_idx][output_len] = '\0';
+        }
+        offset += output_len;
+        
+        // Parse filter shape string
+        if (offset + 4 > payload_length) {
+            ns_lp_printf("Error: Payload too small for filter shape string %u\n", i);
+            return;
+        }
+        uint32_t filter_len = *(uint32_t*)(payload + offset);
+        offset += 4;
+        
+        if (offset + filter_len > payload_length) {
+            ns_lp_printf("Error: Filter shape string %u out of bounds\n", i);
+            return;
+        }
+        
+        g_string_arrays.filter_shapes[op_idx] = (char*)ns_malloc(filter_len + 1);
+        if (g_string_arrays.filter_shapes[op_idx]) {
+            memcpy(g_string_arrays.filter_shapes[op_idx], payload + offset, filter_len);
+            g_string_arrays.filter_shapes[op_idx][filter_len] = '\0';
+        }
+        offset += filter_len;
+        
+        // Debug: print first few strings
+        if (i < 3) {
+            ns_lp_printf("  Op %u: MAC='%s', Output='%s', Filter='%s'\n", op_idx,
+                        g_string_arrays.mac_strings[op_idx] ? g_string_arrays.mac_strings[op_idx] : "NULL",
+                        g_string_arrays.output_shapes[op_idx] ? g_string_arrays.output_shapes[op_idx] : "NULL",
+                        g_string_arrays.filter_shapes[op_idx] ? g_string_arrays.filter_shapes[op_idx] : "NULL");
+        }
+    }
+    
+    ns_lp_printf("Finished parsing string arrays chunk data\n");
+    
+    // Send ACK for this chunk
+    ns_lp_printf("About to send ACK for string arrays chunk %u\n", header->chunk_id);
+    sendAck(header->chunk_id);
+    ns_lp_printf("ACK sent for string arrays chunk %u\n", header->chunk_id);
+    
+    // Check if this is the last chunk
+    if (header->chunk_id == header->total_chunks - 1) {
+        ns_lp_printf("Successfully received all string arrays chunks for %u operators\n", total_operators);
+        
+        // Print a summary of the string arrays for TFLM profiling
+        ns_lp_printf("=== STRING ARRAYS SUMMARY ===\n");
+        ns_lp_printf("Total operators: %u\n", g_string_arrays.num_operators);
+        ns_lp_printf("Arrays allocated: %s\n", g_string_arrays.allocated ? "YES" : "NO");
+        ns_lp_printf("MAC strings array: %p\n", g_string_arrays.mac_strings);
+        ns_lp_printf("Output shapes array: %p\n", g_string_arrays.output_shapes);
+        ns_lp_printf("Filter shapes array: %p\n", g_string_arrays.filter_shapes);
+        
+        // Print first few strings
+        ns_lp_printf("First 3 MAC strings: ");
+        for (uint32_t i = 0; i < 3 && i < g_string_arrays.num_operators; i++) {
+            ns_lp_printf("'%s' ", g_string_arrays.mac_strings[i] ? g_string_arrays.mac_strings[i] : "NULL");
+        }
+        ns_lp_printf("\n");
+        
+        ns_lp_printf("=== END STRING ARRAYS SUMMARY ===\n");
+    }
 }
 
 // Handle configuration message to set model location and arena location
@@ -438,6 +929,8 @@ void handle_model_chunk(const uint8_t* data, uint32_t length) {
     }
     if (header->command == CHUNK_CMD_MODEL_DATA) {
         if (!model_state.upload_in_progress) {
+            // Free any existing derived arrays when starting a new model upload
+            free_derived_arrays();
             model_state.total_chunks = header->total_chunks;
             model_state.received_chunks = 0;
             model_state.upload_in_progress = true;
@@ -699,14 +1192,26 @@ volatile int last_acknowledged_chunk = -1; // at file scope
 void msgReceived(const uint8_t *buffer, uint32_t length, void *args) {
     ns_lp_printf("=== msgReceived called ===\n");
     ns_lp_printf("Received %d bytes\n", length);
-    if (length >= 13) {
-        const usb_message_header_t* header = (const usb_message_header_t*)buffer;
-        const uint8_t* payload = buffer + 13;
-        uint32_t payload_length = length - 13;
+    
+    // Check for frame header (0x00 0x02) and skip it if present
+    const uint8_t* data = buffer;
+    uint32_t data_length = length;
+    
+    if (length >= 15 && buffer[0] == 0x00 && buffer[1] == 0x02) {
+        // Frame header found, skip it
+        data = buffer + 2;
+        data_length = length - 2;
+        ns_lp_printf("Frame header found, processing %d bytes of data\n", data_length);
+    }
+    
+    if (data_length >= 13) {
+        const usb_message_header_t* header = (const usb_message_header_t*)data;
+        const uint8_t* payload = data + 13;
+        uint32_t payload_length = data_length - 13;
         ns_lp_printf("Header: CRC32=0x%08X, cmd=%d, chunk=%u, total=%u\n", header->crc32, header->command, header->chunk_id, header->total_chunks);
         if (header->command == CHUNK_CMD_MODEL_DATA) {
             ns_lp_printf("Processing model chunk\n");
-            handle_model_chunk(buffer, length);
+            handle_model_chunk(data, data_length);
             // return;
         } else if (header->command == CHUNK_CMD_CONFIG) {
             ns_lp_printf("Processing configuration\n");
@@ -716,6 +1221,16 @@ void msgReceived(const uint8_t *buffer, uint32_t length, void *args) {
         } else if (header->command == CHUNK_CMD_RUN_STATS) {
             ns_lp_printf("Processing RUN_STATS command\n");
             run_model_and_send_stats();
+            // return;
+        } else if (header->command == CHUNK_CMD_DERIVED_ARRAYS) {
+            ns_lp_printf("Processing derived arrays\n");
+            handle_derived_arrays(data, data_length);
+            ns_lp_printf("Derived arrays received\n");
+            // return;
+        } else if (header->command == CHUNK_CMD_STRING_ARRAYS) {
+            ns_lp_printf("Processing string arrays\n");
+            handle_string_arrays(data, data_length);
+            ns_lp_printf("String arrays received\n");
             // return;
         } else if (header->command == CHUNK_CMD_PMU_CSV && !pmu_csv_state.in_progress) {
             ns_lp_printf("Starting PMU CSV transfer (blocking loop)\n");
@@ -735,7 +1250,7 @@ void msgReceived(const uint8_t *buffer, uint32_t length, void *args) {
             ns_lp_printf("Unknown command: %d\n", header->command);
         }
     } else {
-        ns_lp_printf("Packet too short for header (need 13, got %d)\n", length);
+        ns_lp_printf("Packet too short for header (need 13, got %d)\n", data_length);
     }
     ns_lp_printf("=== end msgReceived ===\n");
 }
